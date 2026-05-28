@@ -38,7 +38,7 @@ const CONFIG_FILE = path.join(__dirname, "config.json");
 const ALLOWED_ORIGINS = [
   "http://localhost:4200",
   "http://localhost:3000",
-  "https://vanzara1.onrender.com",
+  "https://jaya-gy5o.onrender.com",
 ];
 
 app.use((req, res, next) => {
