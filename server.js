@@ -14,7 +14,7 @@ const app = express();
 
 // Allow requests from the frontend (Render static site + local dev)
 const ALLOWED_ORIGINS = [
-  "https://jaya-1-cmi6.onrender.com/",
+  "https://jaya-1-cmi6.onrender.com",
   "http://localhost:4200",
   "http://localhost:3000",
 ];
@@ -314,12 +314,12 @@ function analyzeSignal() {
     const downTicks = (recent.length - 1) - upTicks;
 
     const emaBull  = ema9 > ema21;
-    const rsiBull  = rsi < 50;
+    const rsiBull  = rsi < 45;
     const momBull  = upTicks >= 3;
     const macdBull = macd >= 0;
 
     const emaBear  = !emaBull;
-    const rsiBear  = !rsiBull;
+    const rsiBear  = rsi > 55;
     const momBear  = downTicks >= 3;
     const macdBear = macd < 0;
 
@@ -329,21 +329,13 @@ function analyzeSignal() {
     if (bullScore >= 3 && bullScore > bearScore) {
       signal = "BUY";
       reason = `SMART BUY ${bullScore}/4: EMA${emaBull?"↑":"↓"} RSI${rsi} Mom${upTicks}/5 MACD${macdBull?"↑":"↓"}`;
-      strength = 50 + bullScore * 12;
+      strength = 65 + bullScore * 10;
     } else if (bearScore >= 3 && bearScore > bullScore) {
       signal = "SELL";
       reason = `SMART SELL ${bearScore}/4: EMA${emaBear?"↓":"↑"} RSI${rsi} Mom${downTicks}/5 MACD${macdBear?"↓":"↑"}`;
-      strength = 50 + bearScore * 12;
-    } else if (bullScore === 2 && bullScore > bearScore) {
-      signal = "BUY";
-      reason = `SMART BUY 2/4: RSI${rsi} EMA${emaBull?"Bull":"Bear"} Mom${upTicks}/5`;
-      strength = 52;
-    } else if (bearScore === 2 && bearScore > bullScore) {
-      signal = "SELL";
-      reason = `SMART SELL 2/4: RSI${rsi} EMA${emaBear?"Bear":"Bull"} Mom${downTicks}/5`;
-      strength = 52;
+      strength = 65 + bearScore * 10;
     } else {
-      reason = `SMART: Signals tied (Bull:${bullScore} Bear:${bearScore} RSI:${rsi})`;
+      reason = `SMART: Waiting for 3/4 (Bull:${bullScore} Bear:${bearScore} RSI:${rsi})`;
       strength = 20;
     }
   } else if (state.strategy === "RSI_EMA") {
@@ -779,13 +771,13 @@ function runBotLogic() {
 
   // Rate limit: don't spam signals
   const now = Date.now();
-  if (now - state.lastSignalTime < 3000) return;
+  if (now - state.lastSignalTime < 60000) return;
 
   const analysis = analyzeSignal();
   broadcast({ type: "SIGNAL_UPDATE", analysis });
   state.lastSignalTime = now;
 
-  if (analysis.signal === "WAIT" || analysis.strength < 50) return;
+  if (analysis.signal === "WAIT" || analysis.strength < 62) return;
 
   // Determine contract type
   let contractType = state.contractType;
@@ -862,9 +854,18 @@ function startBot() {
   state.martStep = 0;
   state.stake = state.baseStake;
   state.paused = false;
+  state.consecutiveLosses = 0;
+  state.todayWins = 0;
+  state.todayLosses = 0;
+  state.todayPnl = 0;
+  state.todayTradeCount = 0;
+  state.bestStreak = 0;
+  state.currentStreak = 0;
+  state.lastSignalTime = 0;
   saveSettings();
   broadcast({ type: "BOT_STATUS", running: true });
-  log("Bot started", "ok");
+  broadcast({ type: "STATS_RESET", stats: getStats() });
+  log("Bot started — daily stats reset", "ok");
 }
 
 function stopBot() {
