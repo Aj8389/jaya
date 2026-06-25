@@ -14,6 +14,7 @@ const app = express();
 
 // Allow requests from the frontend (Render static site + local dev)
 const ALLOWED_ORIGINS = [
+   "https://saaky.onrender.com",
   "https://jaya-1-cmi6.onrender.com",
   "http://localhost:4200",
   "http://localhost:3000",
@@ -35,7 +36,8 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-const DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089";
+// Deriv OAuth 2.0 PKCE — new OTP-based WebSocket flow
+const DERIV_API_BASE = "https://api.derivws.com";
 const PORT = process.env.PORT || 3000;
 const ENV_FILE = path.join(__dirname, ".env");
 const CONFIG_FILE = path.join(__dirname, "config.json");
@@ -67,9 +69,14 @@ function formatEnv(env) {
     .join("\n") + "\n";
 }
 
-// Deriv API tokens are alphanumeric, typically 15-64 chars, no spaces
+// Accepts Deriv OAuth 2.0 PKCE tokens (ory_at_...) and legacy API tokens
 function isValidToken(t) {
-  return typeof t === 'string' && /^[A-Za-z0-9_-]{10,64}$/.test(t);
+  if (typeof t !== 'string' || !t.trim()) return false;
+  const tok = t.trim();
+  // New OAuth 2.0 PKCE tokens — starts with ory_at_ and has printable chars (no whitespace)
+  if (tok.startsWith('ory_at_') && tok.length > 20 && !/\s/.test(tok)) return true;
+  // Legacy Deriv API tokens (alphanumeric, 15–64 chars)
+  return /^[A-Za-z0-9_-]{15,64}$/.test(tok);
 }
 
 function loadConfig() {
@@ -144,8 +151,13 @@ function saveSettings() {
 // GLOBAL STATE
 // ─────────────────────────────────────────────
 let state = {
-  derivSocket: null,
   browserClients: new Set(),
+
+  derivWs: null,
+  accountId: null,
+  accountType: "real",
+  pendingAuth: false,
+  connecting: false,
 
   token: null,
   authorized: false,
@@ -181,6 +193,9 @@ let state = {
   paused: false,
   pauseTimer: null,
 
+  autoExitOnProfit: false,
+  autoExitProfitPct: 30,   // exit when profit >= 30% of stake
+
   todayWins: 0,
   todayLosses: 0,
   todayPnl: 0,
@@ -205,6 +220,7 @@ let state = {
   pendingProposal: null,
   tradeTimeout: null,
   autoStartPending: false,
+  contractCanSell: false,
 };
 
 // ─────────────────────────────────────────────
@@ -213,8 +229,14 @@ let state = {
 function nextId() { return ++state.reqId; }
 
 function sendDeriv(data) {
-  if (state.derivSocket && state.derivSocket.readyState === WebSocket.OPEN) {
-    state.derivSocket.send(JSON.stringify(data));
+  if (!state.derivWs || state.derivWs.readyState !== WebSocket.OPEN) {
+    log("Deriv not connected — cannot send request", "err");
+    return;
+  }
+  try {
+    state.derivWs.send(JSON.stringify(data));
+  } catch (e) {
+    log(`sendDeriv error: ${e.message}`, "err");
   }
 }
 
@@ -314,28 +336,28 @@ function analyzeSignal() {
     const downTicks = (recent.length - 1) - upTicks;
 
     const emaBull  = ema9 > ema21;
-    const rsiBull  = rsi < 45;
+    const rsiBull  = rsi < 45;   // meaningful oversold lean, not just below 50
     const momBull  = upTicks >= 3;
     const macdBull = macd >= 0;
 
     const emaBear  = !emaBull;
-    const rsiBear  = rsi > 55;
+    const rsiBear  = rsi > 55;   // meaningful overbought lean, not just above 50
     const momBear  = downTicks >= 3;
     const macdBear = macd < 0;
 
     const bullScore = (emaBull ? 1 : 0) + (rsiBull ? 1 : 0) + (momBull ? 1 : 0) + (macdBull ? 1 : 0);
     const bearScore = (emaBear ? 1 : 0) + (rsiBear ? 1 : 0) + (momBear ? 1 : 0) + (macdBear ? 1 : 0);
 
-    if (bullScore >= 3 && bullScore > bearScore) {
+    if (bullScore >= 3 && bullScore > bearScore && rsi < 65) {
       signal = "BUY";
       reason = `SMART BUY ${bullScore}/4: EMA${emaBull?"↑":"↓"} RSI${rsi} Mom${upTicks}/5 MACD${macdBull?"↑":"↓"}`;
-      strength = 65 + bullScore * 10;
-    } else if (bearScore >= 3 && bearScore > bullScore) {
+      strength = 50 + bullScore * 12;
+    } else if (bearScore >= 3 && bearScore > bullScore && rsi > 35) {
       signal = "SELL";
       reason = `SMART SELL ${bearScore}/4: EMA${emaBear?"↓":"↑"} RSI${rsi} Mom${downTicks}/5 MACD${macdBear?"↓":"↑"}`;
-      strength = 65 + bearScore * 10;
+      strength = 50 + bearScore * 12;
     } else {
-      reason = `SMART: Waiting for 3/4 (Bull:${bullScore} Bear:${bearScore} RSI:${rsi})`;
+      reason = `SMART: Weak/risky signal (Bull:${bullScore} Bear:${bearScore} RSI:${rsi})`;
       strength = 20;
     }
   } else if (state.strategy === "RSI_EMA") {
@@ -347,16 +369,8 @@ function analyzeSignal() {
       signal = "SELL";
       reason = `RSI high (${rsi}) + bearish EMA`;
       strength = Math.round(60 + (rsi - 60) * 1.5);
-    } else if (rsi < 45 && ema9 > ema21) {
-      signal = "BUY";
-      reason = `RSI leaning low (${rsi}) + bullish EMA`;
-      strength = 52;
-    } else if (rsi > 55 && ema9 < ema21) {
-      signal = "SELL";
-      reason = `RSI leaning high (${rsi}) + bearish EMA`;
-      strength = 52;
     } else {
-      reason = `RSI: ${rsi} | EMA: ${ema9 > ema21 ? "Bull" : "Bear"}`;
+      reason = `RSI: ${rsi} | EMA: ${ema9 > ema21 ? "Bull" : "Bear"} — weak, skipping`;
       strength = 20;
     }
   } else if (state.strategy === "BOLLINGER" && boll) {
@@ -368,14 +382,9 @@ function analyzeSignal() {
       signal = "SELL";
       reason = `Price above upper band (${boll.upper.toFixed(2)})`;
       strength = Math.round(65 + Math.min(30, ((price - boll.upper) / boll.upper) * 1000));
-    } else if (price <= boll.middle) {
-      signal = "BUY";
-      reason = `Price below mid-band — bounce expected`;
-      strength = 53;
     } else {
-      signal = "SELL";
-      reason = `Price above mid-band — pullback expected`;
-      strength = 53;
+      reason = `Price inside bands — weak, skipping`;
+      strength = 20;
     }
   } else if (state.strategy === "MACD") {
     const prevMacd = calcMACD(prices.slice(0, -1));
@@ -387,32 +396,24 @@ function analyzeSignal() {
       signal = "SELL";
       reason = `MACD bearish crossover (${macd.toFixed(4)})`;
       strength = Math.round(70 + Math.min(25, Math.abs(macd) * 5000));
-    } else if (macd > 0) {
-      signal = "BUY";
-      reason = `MACD bullish trend (${macd.toFixed(4)})`;
-      strength = 52;
-    } else if (macd < 0) {
-      signal = "SELL";
-      reason = `MACD bearish trend (${macd.toFixed(4)})`;
-      strength = 52;
     } else {
-      reason = `MACD flat`;
+      reason = `MACD: no crossover (${macd.toFixed(4)}) — weak, skipping`;
       strength = 20;
     }
   } else if (state.strategy === "SCALPER") {
     if (prices.length >= 5) {
       const recent = prices.slice(-5);
       const up = recent.filter((p, i) => i > 0 && p > recent[i - 1]).length;
-      if (up >= 3) {
+      if (up === 4) {
         signal = "SELL";
-        reason = `Scalper: ${up}/4 up ticks → reversal`;
-        strength = 50 + up * 10;
-      } else if (up <= 1) {
+        reason = `Scalper: 4/4 up ticks → strong reversal`;
+        strength = 90;
+      } else if (up === 0) {
         signal = "BUY";
-        reason = `Scalper: ${4 - up}/4 down ticks → reversal`;
-        strength = 50 + (4 - up) * 10;
+        reason = `Scalper: 4/4 down ticks → strong reversal`;
+        strength = 90;
       } else {
-        reason = `Scalper: mixed ticks (${up}/4 up)`;
+        reason = `Scalper: mixed ticks (${up}/4 up) — weak, skipping`;
         strength = 20;
       }
     }
@@ -423,58 +424,167 @@ function analyzeSignal() {
 }
 
 // ─────────────────────────────────────────────
-// CONNECT TO DERIV
+// DERIV OAUTH + OTP + WEBSOCKET CONNECTION
 // ─────────────────────────────────────────────
-function connectDeriv(token) {
+async function getDerivAccounts(token) {
+  const res = await fetch(`${DERIV_API_BASE}/trading/v1/options/accounts`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`GET accounts ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+async function getDerivOtp(token, accountId) {
+  const res = await fetch(`${DERIV_API_BASE}/trading/v1/options/accounts/${accountId}/otp`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`POST otp ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+function openDerivWebSocket(wsUrl) {
+  if (state.derivWs) {
+    try { state.derivWs.terminate(); } catch (_) {}
+    state.derivWs = null;
+  }
+
+  log(`Opening Deriv WebSocket...`, "info");
+  broadcast({ type: "CONN_STATUS", status: "connecting", label: "CONNECTING..." });
+
+  const ws = new WebSocket(wsUrl);
+  state.derivWs = ws;
+
+  ws.on("open", () => {
+    if (state.derivWs !== ws) return; // stale — a newer connection took over
+
+    log("Deriv WebSocket connected successfully", "ok");
+    state.authorized = true;
+    state.pendingAuth = true;
+    state.connecting = false;
+
+    sendDeriv({ balance: 1, subscribe: 1, req_id: nextId() });
+    subscribeTicks(state.symbol);
+
+    if (state.autoStartPending || state.botRunning) {
+      state.autoStartPending = false;
+      state.botRunning = false;
+      setTimeout(() => {
+        log("Auto-resuming bot after reconnect", "ok");
+        startBot();
+      }, 3000);
+    }
+  });
+
+  ws.on("message", (raw) => {
+    if (state.derivWs !== ws) return; // stale
+    let data;
+    try { data = JSON.parse(raw.toString()); } catch (_) { return; }
+    handleDerivMessage(data);
+  });
+
+  ws.on("close", (code) => {
+    if (state.derivWs !== ws) return; // stale
+    log(`Deriv WebSocket closed (code ${code}) — reconnecting...`, "warn");
+    state.authorized = false;
+    state.pendingAuth = false;
+    state.connecting = false;
+    state.derivWs = null;
+    broadcast({ type: "CONN_STATUS", status: "disconnected", label: "RECONNECTING..." });
+    if (state.token && state.accountId) {
+      setTimeout(() => reconnectDeriv(), 5000);
+    }
+  });
+
+  ws.on("error", (err) => {
+    if (state.derivWs !== ws) return; // stale
+    console.error("Deriv WebSocket Error:", err);
+    log(`Deriv WebSocket error: ${err.message}`, "err");
+  });
+}
+
+async function reconnectDeriv() {
+  if (!state.token || !state.accountId) return;
+  log("Generating fresh OTP for reconnect...", "info");
+  try {
+    const otpData = await getDerivOtp(state.token, state.accountId);
+    const wsUrl = (otpData.data && (otpData.data.ws_url || otpData.data.websocket_url || otpData.data.url)) || otpData.ws_url || otpData.websocket_url || otpData.url;
+    if (!wsUrl) throw new Error("No WebSocket URL in OTP response");
+    openDerivWebSocket(wsUrl);
+  } catch (err) {
+    log(`Reconnect failed: ${err.message} — retrying in 10s`, "err");
+    setTimeout(() => reconnectDeriv(), 10000);
+  }
+}
+
+async function connectDeriv(token) {
+  token = (token || '').trim();
   if (!isValidToken(token)) {
-    log("Invalid or missing API token — enter your token in the UI", "err");
-    broadcast({ type: "CONN_STATUS", status: "error", label: "NO TOKEN — enter API token" });
-    broadcast({ type: "DERIV_ERROR", message: "Invalid API token. Please enter a valid Deriv API token." });
+    log("Invalid or missing OAuth token — enter your ory_at_... token in the UI", "err");
+    broadcast({ type: "CONN_STATUS", status: "error", label: "NO TOKEN — enter OAuth token" });
+    broadcast({ type: "DERIV_ERROR", message: "Invalid OAuth token. Token must start with ory_at_ (Deriv OAuth 2.0 PKCE)." });
+    return;
+  }
+
+  // Prevent duplicate concurrent connections with the same token
+  if (state.connecting && state.token === token) {
+    log("Connection already in progress — skipping duplicate connect", "info");
     return;
   }
 
   state.token = token;
+  state.connecting = true;
+  broadcast({ type: "CONN_STATUS", status: "connecting", label: "FETCHING ACCOUNTS..." });
 
-  if (state.derivSocket) {
-    try { state.derivSocket.close(); } catch (e) {}
-  }
+  try {
+    // Step 1: Get accounts
+    log("Fetching Deriv accounts...", "info");
+    const accountsData = await getDerivAccounts(token);
+    const accounts = Array.isArray(accountsData) ? accountsData : (accountsData.data || accountsData.accounts || []);
+    if (!accounts.length) throw new Error("No accounts returned from Deriv");
 
-  log("Connecting to Deriv WebSocket...", "info");
-  broadcast({ type: "CONN_STATUS", status: "connecting", label: "CONNECTING..." });
+    // Step 2: Select demo or real account
+    let account;
+    if (state.accountType === "real") {
+      account = accounts.find(
+        a => a.account_type === "real" || a.type === "real" || a.type === "financial" || a.type === "gaming" || a.type === "crypto"
+      ) || accounts[0];
+    } else {
+      account = accounts.find(
+        a => a.account_type === "demo" || a.type === "demo" || a.type === "virtual"
+      ) || accounts[0];
+    }
+    state.accountId = account.account_id || account.id || account.loginid;
+    log(`Selected account: ${state.accountId} (${account.account_type || account.type || "unknown"})`, "info");
 
-  const ws = new WebSocket(DERIV_WS);
-  state.derivSocket = ws;
+    // Step 3: Generate OTP → get WebSocket URL
+    log("Generating OTP...", "info");
+    const otpData = await getDerivOtp(token, state.accountId);
+    console.log("OTP Response:", JSON.stringify(otpData, null, 2));
+    const wsUrl = (otpData.data && (otpData.data.ws_url || otpData.data.websocket_url || otpData.data.url)) || otpData.ws_url || otpData.websocket_url || otpData.url;
+    if (!wsUrl) {
+      console.error("Invalid OTP Response:", otpData);
+      throw new Error("No WebSocket URL returned by Deriv");
+    }
 
-  ws.on("open", () => {
-    log("Deriv WS connected. Authorizing...", "ok");
-    sendDeriv({ authorize: token, req_id: nextId() });
-  });
+    // Step 4: Connect WebSocket (no authorize message needed)
+    log("Opening Deriv WebSocket...", "info");
+    console.log("Deriv WebSocket URL:", wsUrl);
+    openDerivWebSocket(wsUrl);
 
-  ws.on("message", (raw) => {
-    let data;
-    try { data = JSON.parse(raw.toString()); } catch (e) { return; }
-    handleDerivMessage(data);
-  });
-
-  ws.on("error", (err) => {
-    log("Deriv WS Error: " + err.message, "err");
-    broadcast({ type: "CONN_STATUS", status: "error", label: "WS ERROR" });
-  });
-
-  ws.on("close", () => {
-    log("Deriv WS closed — reconnecting in 5s...", "warn");
+  } catch (err) {
+    log(`connectDeriv failed: ${err.message}`, "err");
+    broadcast({ type: "CONN_STATUS", status: "error", label: "Connection failed — check token" });
+    broadcast({ type: "DERIV_ERROR", message: err.message });
     state.authorized = false;
-    broadcast({ type: "CONN_STATUS", status: "error", label: "RECONNECTING..." });
-
-    // Auto-reconnect using saved token
-    setTimeout(() => {
-      const savedToken = state.token || (loadConfig().token);
-      if (savedToken) {
-        log("Auto-reconnecting to Deriv...", "info");
-        connectDeriv(savedToken);
-      }
-    }, 5000);
-  });
+    state.connecting = false;
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -482,20 +592,25 @@ function connectDeriv(token) {
 // ─────────────────────────────────────────────
 function handleDerivMessage(data) {
   if (data.error) {
+    const code = data.error.code || "";
     const message = data.error.message || "Unknown Deriv error.";
-    log(`Deriv Error: ${message}`, "err");
-    broadcast({ type: "LOG", level: "err", msg: message });
+    log(`Deriv Error [${code}]: ${message}`, "err");
+    broadcast({ type: "DERIV_ERROR", message });
 
-    let connLabel = "Deriv auth failed — see log";
-    if (message.includes("Account is disabled")) {
-      connLabel = "Account disabled — verify Deriv account";
-    } else if (message.includes("Parameters sanity check failed")) {
-      connLabel = "Invalid API token — verify token format";
+    // Only treat as a session-level failure for actual auth errors
+    const isAuthError = code === "AuthorizationRequiredError" || code === "InvalidToken"
+      || message.includes("Account is disabled") || message.includes("AuthorizationRequired");
+    if (isAuthError) {
+      state.authorized = false;
+      broadcast({ type: "CONN_STATUS", status: "error", label: "Auth error — reconnecting" });
+      if (state.token && state.accountId) setTimeout(() => reconnectDeriv(), 3000);
     }
 
-    broadcast({ type: "CONN_STATUS", status: "error", label: connLabel });
-    broadcast({ type: "DERIV_ERROR", message });
-    state.authorized = false;
+    // Clear pending trade state on buy/proposal errors
+    if (data.msg_type === "proposal" || data.msg_type === "buy") {
+      state.activeTrade = null;
+      state.pendingProposal = null;
+    }
     return;
   }
 
@@ -523,42 +638,20 @@ function handleDerivMessage(data) {
     return;
   }
 
-  // AUTHORIZE
-  if (data.msg_type === "authorize") {
-    const auth = data.authorize;
-    state.authorized = true;
-    state.loginid = auth.loginid;
-    state.balance = parseFloat(auth.balance);
-    state.currency = auth.currency;
-
-    log(`Authorized: ${auth.loginid} | Balance: ${auth.balance} ${auth.currency}`, "ok");
-    broadcast({
-      type: "AUTHORIZED",
-      loginid: auth.loginid,
-      balance: auth.balance,
-      currency: auth.currency,
-    });
-
-    // Subscribe to balance & ticks
-    sendDeriv({ balance: 1, subscribe: 1, req_id: nextId() });
-    subscribeTicks(state.symbol);
-
-    // Resume bot if it was running before the reconnect/restart
-    if (state.autoStartPending || state.botRunning) {
-      state.autoStartPending = false;
-      const wasRunning = state.botRunning;
-      state.botRunning = false; // reset so startBot re-initialises cleanly
-      setTimeout(() => {
-        log("Auto-resuming bot after reconnect", "ok");
-        startBot();
-      }, 3000);
-    }
-    return;
-  }
-
-  // BALANCE
+  // BALANCE — first response after connect also carries loginid/currency
   if (data.msg_type === "balance") {
-    state.balance = parseFloat(data.balance.balance);
+    const bal = data.balance;
+    state.balance = parseFloat(bal.balance);
+    if (bal.currency) state.currency = bal.currency;
+    if (bal.loginid) state.loginid = bal.loginid;
+
+    if (state.pendingAuth) {
+      state.pendingAuth = false;
+      log(`Connected: ${state.loginid} | Balance: ${state.balance} ${state.currency}`, "ok");
+      broadcast({ type: "AUTHORIZED", loginid: state.loginid, balance: state.balance, currency: state.currency });
+      broadcast({ type: "CONN_STATUS", status: "connected", label: "CONNECTED" });
+    }
+
     broadcast({ type: "BALANCE_UPDATE", balance: state.balance, currency: state.currency });
     return;
   }
@@ -605,13 +698,14 @@ function handleDerivMessage(data) {
 
     const contract = data.buy;
     state.activeContractId = contract.contract_id;
+    state.contractCanSell = false;
 
     // Use the actual buy price from Deriv as entry price
     const trade = {
       openTime: Date.now(),
       direction: state.activeTrade?.direction || "BUY",
       stake: state.stake,
-      entryPrice: parseFloat(contract.buy_price) || state.currentPrice,
+      entryPrice: state.currentPrice,
       status: "open",
     };
     state.activeTrade = trade;
@@ -647,15 +741,28 @@ function handleDerivMessage(data) {
     // Ignore stale updates from previous contracts
     if (poc.contract_id !== state.activeContractId) return;
 
-    broadcast({ type: "CONTRACT_UPDATE", contract: poc });
+    state.contractCanSell = poc.is_valid_to_sell === 1;
+    broadcast({ type: "CONTRACT_UPDATE", contract: poc, canSell: state.contractCanSell });
 
     const settled = poc.is_expired === 1 || poc.is_sold === 1
                  || poc.status === "won" || poc.status === "lost";
 
     if (settled && state.activeTrade) {
+      state.contractCanSell = false;
       clearTimeout(state.tradeTimeout);
       state.tradeTimeout = null;
       handleContractClose(poc);
+      return;
+    }
+
+    // Auto exit early when profit threshold is reached — only if resale is allowed
+    if (!settled && state.contractCanSell && state.autoExitOnProfit && state.activeTrade && poc.profit !== undefined) {
+      const profitPct = (parseFloat(poc.profit) / state.stake) * 100;
+      if (profitPct >= state.autoExitProfitPct) {
+        log(`Auto exit: +${profitPct.toFixed(1)}% profit — locking in gains`, "ok");
+        state.contractCanSell = false;
+        sendDeriv({ sell: state.activeContractId, price: 0, req_id: nextId() });
+      }
     }
     return;
   }
@@ -771,7 +878,7 @@ function runBotLogic() {
 
   // Rate limit: don't spam signals
   const now = Date.now();
-  if (now - state.lastSignalTime < 60000) return;
+  if (now - state.lastSignalTime < 3000) return;
 
   const analysis = analyzeSignal();
   broadcast({ type: "SIGNAL_UPDATE", analysis });
@@ -815,7 +922,7 @@ function placeTrade(contractType, direction) {
   sendDeriv({
     proposal: 1,
     contract_type: contractType,
-    symbol: state.symbol,
+    underlying_symbol: state.symbol,
     duration: state.duration,
     duration_unit: state.durationUnit,
     basis: "stake",
@@ -843,6 +950,8 @@ function applySettings(s) {
   if (s.duration !== undefined) state.duration = parseInt(s.duration);
   if (s.durationUnit !== undefined) state.durationUnit = s.durationUnit;
   if (s.pauseOn3Losses !== undefined) state.pauseOn3Losses = s.pauseOn3Losses;
+  if (s.autoExitOnProfit !== undefined) state.autoExitOnProfit = s.autoExitOnProfit;
+  if (s.autoExitProfitPct !== undefined) state.autoExitProfitPct = parseFloat(s.autoExitProfitPct);
   saveSettings();
 }
 
@@ -854,18 +963,9 @@ function startBot() {
   state.martStep = 0;
   state.stake = state.baseStake;
   state.paused = false;
-  state.consecutiveLosses = 0;
-  state.todayWins = 0;
-  state.todayLosses = 0;
-  state.todayPnl = 0;
-  state.todayTradeCount = 0;
-  state.bestStreak = 0;
-  state.currentStreak = 0;
-  state.lastSignalTime = 0;
   saveSettings();
   broadcast({ type: "BOT_STATUS", running: true });
-  broadcast({ type: "STATS_RESET", stats: getStats() });
-  log("Bot started — daily stats reset", "ok");
+  log("Bot started", "ok");
 }
 
 function stopBot() {
@@ -938,15 +1038,12 @@ wss.on("connection", (browserWs) => {
     try { cmd = JSON.parse(raw.toString()); } catch (e) { return; }
 
     switch (cmd.type) {
-      case "CONNECT":
-        // Persist token so server can auto-connect on restart
+      case "CONNECT": {
         saveConfig({ token: cmd.token });
-        // If already authorized with the same token and socket is open, just sync this client
-        if (
-          state.authorized &&
-          state.token === cmd.token &&
-          state.derivSocket?.readyState === WebSocket.OPEN
-        ) {
+        const newAccountType = cmd.accountType || "real";
+        const accountTypeChanged = newAccountType !== state.accountType;
+        state.accountType = newAccountType;
+        if (state.authorized && state.token === cmd.token && !accountTypeChanged) {
           browserWs.send(JSON.stringify({
             type: "AUTHORIZED",
             loginid: state.loginid,
@@ -958,6 +1055,7 @@ wss.on("connection", (browserWs) => {
           connectDeriv(cmd.token);
         }
         break;
+      }
 
       case "START_BOT":
         if (cmd.settings) applySettings(cmd.settings);
@@ -970,6 +1068,12 @@ wss.on("connection", (browserWs) => {
 
       case "EMERGENCY_STOP":
         emergencyStop();
+        break;
+
+      case "EXIT_TRADE":
+        if (!state.activeContractId) { log("No active contract to exit", "warn"); break; }
+        log("Early exit — selling contract now", "warn");
+        sendDeriv({ sell: state.activeContractId, price: 0, req_id: nextId() });
         break;
 
       case "CHANGE_SYMBOL":
